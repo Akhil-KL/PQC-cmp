@@ -287,7 +287,8 @@ HOLE_DARK_OFFSET = 5                # Additional offset added to the percentile 
                                     # shallow shadows are not classified as holes.
 HOLE_DARK_MAX = 55                  # Hard ceiling on the dark threshold — prevents merging with
                                     # mid-tone product surface at higher thresholds.
-HOLE_MIN_RADIUS = 3                 # Minimum hole radius in pixels
+HOLE_MIN_RADIUS = 6                 # Minimum hole radius in pixels — excludes surface marks
+                                    # and pits smaller than ~12px diameter
 HOLE_MAX_RADIUS = 150               # Maximum hole radius in pixels (large centre bores allowed)
 HOLE_MIN_CIRCULARITY = 0.45         # Minimum circularity for a dark blob to be classified HOLE
 HOLE_MIN_SOLIDITY = 0.65            # Minimum solidity — holes are compact, filled regions

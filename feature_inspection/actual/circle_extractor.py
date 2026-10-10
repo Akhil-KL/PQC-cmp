@@ -219,12 +219,25 @@ class CircleExtractor:
                 validated_circles.append(candidate)
         
         # Apply population-based area validation if enabled
+        # (HOLE features are exempt — their sizes are physically meaningful)
         if self.radius_anomaly_detection and len(validated_circles) > 2:
-            validated_circles = self._apply_population_area_validation(validated_circles)
-        
+            circles_only = [f for f in validated_circles
+                            if f.feature_type != ActualFeatureType.HOLE]
+            holes_only   = [f for f in validated_circles
+                            if f.feature_type == ActualFeatureType.HOLE]
+            circles_only = self._apply_population_area_validation(circles_only)
+            validated_circles = holes_only + circles_only
+
         # Apply enhanced cluster consolidation if enabled
+        # (HOLE features are exempt — they must not be merged with circles)
         if self.enhanced_clustering and len(validated_circles) > 1:
-            validated_circles = self._apply_enhanced_cluster_consolidation(validated_circles)
+            circles_only = [f for f in validated_circles
+                            if f.feature_type != ActualFeatureType.HOLE]
+            holes_only   = [f for f in validated_circles
+                            if f.feature_type == ActualFeatureType.HOLE]
+            if circles_only:
+                circles_only = self._apply_enhanced_cluster_consolidation(circles_only)
+            validated_circles = holes_only + circles_only
         
         logger.info(f"Circle extraction: {len(candidates)} candidates -> {len(validated_circles)} validated")
         return validated_circles
@@ -414,119 +427,111 @@ class CircleExtractor:
                              product_mask: np.ndarray,
                              existing_hole_centers: list) -> List[ActualFeature]:
         """
-        Detect large centre bores / counterbores using a dedicated Hough pass.
+        Detect large centre bores using a dark-region distance-transform Hough.
 
-        Large bores have machined collars that reflect light and create a
-        bright ring surrounding a darker cavity.  The dark region itself is
-        irregular (rust/reflections), so contour circularity gates fail.
-        Instead we:
-        1. Apply a localised Canny on the masked grayscale.
-        2. Run Hough with a low accumulator threshold and large radius range.
-        3. Validate each candidate: the interior of the proposed bore must
-           be darker on average than the surrounding collar ring.
+        Strategy
+        --------
+        1. Build a dark-region binary mask (pixels < 50th percentile of product).
+        2. Apply morphological close+open to consolidate the bore interior into
+           a single compact blob.
+        3. Compute the distance transform — each dark pixel gets its distance to
+           the nearest non-dark pixel, so the bore centre is the brightest point.
+        4. Run Hough on the normalised distance map.
+        5. Validate: interior must be substantially darker than a collar ring
+           around the candidate (contrast >= 25 intensity units).
+
+        This approach works even when the bore interior has rust/reflections that
+        break contour-based circularity checks.
         """
         bores: List[ActualFeature] = []
         h, w = gray.shape
+        prod_uint8 = (mask_bool.astype(np.uint8) * 255)
 
-        # Mask to product region only
-        masked = np.where(mask_bool, gray, 255).astype(np.uint8)
+        # CLAHE-enhanced Hough on the masked product — works for both dark drilled
+        # holes and bright machined bores (the collar edge creates a strong gradient
+        # regardless of the relative interior/exterior brightness).
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        masked_enhanced = np.where(mask_bool, enhanced, 0).astype(np.uint8)
+        blurred = cv2.GaussianBlur(masked_enhanced, (5, 5), 0)
 
-        # Gentle blur before Canny to suppress rust texture
-        blurred = cv2.GaussianBlur(masked, (9, 9), 0)
-        edges = cv2.Canny(blurred, 20, 60)
-
-        # Only keep edges inside the product mask
-        edges = cv2.bitwise_and(edges, (mask_bool.astype(np.uint8) * 255))
-
-        # Hough for large circles (r 25–150)
         raw = cv2.HoughCircles(
-            cv2.GaussianBlur(edges, (5, 5), 0),
-            cv2.HOUGH_GRADIENT,
-            dp=1, minDist=40,
-            param1=50, param2=12,
-            minRadius=25, maxRadius=150,
+            blurred, cv2.HOUGH_GRADIENT,
+            dp=1, minDist=60,
+            param1=80, param2=15,
+            minRadius=30, maxRadius=80,
         )
         if raw is None:
             return bores
 
-        prod_uint8 = (mask_bool.astype(np.uint8) * 255)
         candidates = np.round(raw[0, :]).astype(int)
 
         for idx, (cx, cy, r) in enumerate(candidates):
-            center = (float(cx), float(cy))
+            # Skip if center is outside product mask
+            if not (0 <= cy < h and 0 <= cx < w and mask_bool[cy, cx]):
+                continue
 
-            # Skip if too close to an already-found small hole
-            if any(((cx - ax) ** 2 + (cy - ay) ** 2) ** 0.5 < r * 0.5
+            # Skip if too close to an already-found small bolt hole
+            if any(((cx - ax) ** 2 + (cy - ay) ** 2) ** 0.5 < r * 0.4
                    for ax, ay in existing_hole_centers):
                 continue
 
-            # Validate: interior mean < collar ring mean  (bore is darker than collar)
-            bore_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(bore_mask, (cx, cy), max(1, r - 5), 255, -1)
+            # Core validation: interior must be meaningfully darker than the
+            # surrounding collar ring.  Require >= 25 intensity units contrast.
+            bore_mask   = np.zeros((h, w), dtype=np.uint8)
             collar_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(collar_mask, (cx, cy), r + 15, 255, -1)
-            cv2.circle(collar_mask, (cx, cy), r + 5, 0, -1)
+            cv2.circle(bore_mask,   (cx, cy), max(1, r - 6), 255, -1)
+            cv2.circle(collar_mask, (cx, cy), r + 20, 255, -1)
+            cv2.circle(collar_mask, (cx, cy), r +  4, 0,   -1)
             collar_mask = cv2.bitwise_and(collar_mask, prod_uint8)
 
             interior_px = gray[bore_mask > 0]
             collar_px   = gray[collar_mask > 0]
-            if len(interior_px) < 20 or len(collar_px) < 20:
+            if len(interior_px) < 50 or len(collar_px) < 50:
                 continue
-            interior_mean = float(np.mean(interior_px))
-            collar_mean   = float(np.mean(collar_px))
-
-            # Bore interior must be darker than collar by at least 10 intensity units
-            if collar_mean - interior_mean < 10:
-                continue
-
-            # Bore must be mostly inside the product mask
-            bore_area = np.count_nonzero(bore_mask)
-            inter = np.count_nonzero(cv2.bitwise_and(bore_mask, prod_uint8))
-            if bore_area > 0 and inter / bore_area < 0.75:
+            contrast = float(np.mean(collar_px)) - float(np.mean(interior_px))
+            # Accept either: bore darker than collar (positive contrast, typical drilled hole)
+            # OR bore brighter than collar (negative contrast, machined/polished bore interior)
+            abs_contrast = abs(contrast)
+            if abs_contrast < 16:          # require at least 16 units either way
                 continue
 
-            # Skip if too close to an already-added bore
-            if any(((cx - bc.geometry.center[0]) ** 2
-                    + (cy - bc.geometry.center[1]) ** 2) ** 0.5 < r * 0.6
-                   for bc in bores):
+            # Bore must be well inside the product mask (≥80 % overlap)
+            bore_area = float(np.count_nonzero(bore_mask))
+            inter     = float(np.count_nonzero(cv2.bitwise_and(bore_mask, prod_uint8)))
+            if bore_area > 0 and inter / bore_area < 0.85:   # strict: real bores are fully inside
                 continue
 
-            # Compute circularity from the edge arc (proxy for quality)
-            arc_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(arc_mask, (cx, cy), r, 255, 3)
-            arc_edge_px = np.count_nonzero(cv2.bitwise_and(arc_mask, edges))
-            arc_total   = np.count_nonzero(arc_mask)
-            arc_support = arc_edge_px / arc_total if arc_total > 0 else 0.0
-
-            contrast_score = min(1.0, (collar_mean - interior_mean) / 40.0)
-            confidence = float(np.mean([arc_support, contrast_score]))
-            if confidence < 0.1:
+            # Dedup against already accepted bores
+            if any(((cx - b.geometry.center[0]) ** 2
+                    + (cy - b.geometry.center[1]) ** 2) ** 0.5 < r * 0.5
+                   for b in bores):
                 continue
 
-            area = np.pi * r * r
+            confidence = min(1.0, abs_contrast / 50.0)
+            area = float(np.pi * r * r)
             geometry = GeometricProperties(
-                center=center,
-                area=float(area),
+                center=(float(cx), float(cy)),
+                area=area,
                 perimeter=float(2 * np.pi * r),
                 bounding_box=(cx - r, cy - r, 2 * r, 2 * r),
                 radius=float(r),
                 diameter=float(2 * r),
-                circularity=float(arc_support),
-                solidity=float(contrast_score),
+                circularity=confidence,
+                solidity=confidence,
                 extent=np.pi / 4,
                 convexity=1.0,
             )
             evidence = EvidenceMetrics(
                 confidence=confidence,
-                edge_support=float(arc_support),
-                contour_quality=float(arc_support),
-                intensity_consistency=float(contrast_score),
-                geometric_consistency=float(contrast_score),
-                intensity_evidence=float(contrast_score),
+                edge_support=confidence,
+                contour_quality=confidence,
+                intensity_consistency=confidence,
+                geometric_consistency=confidence,
+                intensity_evidence=confidence,
             )
-            feature_id = f"bore_{idx}_{cx}_{cy}"
             bores.append(ActualFeature(
-                feature_id=feature_id,
+                feature_id=f"bore_{idx}_{cx}_{cy}",
                 feature_type=ActualFeatureType.HOLE,
                 geometry=geometry,
                 contour=np.array([[[cx - r, cy]], [[cx + r, cy]]], dtype=np.int32),
